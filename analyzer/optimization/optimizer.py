@@ -1,194 +1,216 @@
-# analyzer/optimization/optimizer.py
-
+#!/usr/bin/env python3
 import clang.cindex
+from clang.cindex import CursorKind, TokenKind, TranslationUnitLoadError
+import os
+import re
+import sys
+import tempfile
 
-# Import all our analysis phases
-from .cfg import CFGBuilder
-from .liveness import LivenessAnalysis, find_dead_code
-from .available_expr import AvailableExpressionsAnalysis, find_common_subexpressions
-from .loops import find_loop_invariant_code
+# ---------- Set up libclang ----------
+try:
+    clang.cindex.Config.set_library_path("/usr/lib/llvm-14/lib")
+except Exception:
+    pass
 
-# Set libclang path
-clang.cindex.Config.set_library_path("/usr/lib/llvm-14/lib")
 
-class Optimizer:
+# ---------- Basic CFG block (for display only) ----------
+class BasicBlock:
+    def __init__(self, block_id, function_name):
+        self.id = block_id
+        self.function_name = function_name
+        self.statements = []
+
+    def add_statement(self, stmt):
+        self.statements.append(stmt)
+
+    def __repr__(self):
+        return f"Block {self.function_name}_B{self.id}: {len(self.statements)} statements"
+
+
+class CFGBuilder:
     def __init__(self):
-        self.c_code = ""
-        self.optimizations_found = []
-        self.tu = None  # Translation Unit
+        self.blocks = []
+        self.current_block = None
 
-    def get_source_code(self, node):
-        """Helper to get the source code for a given node."""
-        try:
-            extent = node.extent
-            start = extent.start.offset
-            end = extent.end.offset
-            return self.c_code[start:end]
-        except Exception:
-            return f"(Could not get source for node {node.hash})"
+    def build(self, func_cursor):
+        self.blocks = []
+        self.current_block = BasicBlock(0, func_cursor.spelling)
+        self.blocks.append(self.current_block)
+        self._traverse(func_cursor)
+        return self.blocks
 
-    def _find_constant_folding(self, node):
-        """
-        Recursively finds constant folding opportunities (AST-based).
-        """
-        if node.location.file and node.location.file.name != 'test.c':
-            return
+    def _traverse(self, cursor):
+        for c in cursor.get_children():
+            if c.kind == CursorKind.COMPOUND_STMT:
+                self._traverse(c)
+            elif c.kind.is_expression() or c.kind.is_statement():
+                self.current_block.add_statement(c)
 
-        if node.kind == clang.cindex.CursorKind.BINARY_OPERATOR:
-            children = list(node.get_children())
-            if len(children) == 2:
-                left_child, right_child = children
 
-                if (left_child.kind == clang.cindex.CursorKind.INTEGER_LITERAL and
-                    right_child.kind == clang.cindex.CursorKind.INTEGER_LITERAL):
+# ---------- Optimizer ----------
+class Optimizer:
+    NOISE_TOKENS = {
+        "__bswap_16", "__bswap_32", "__bswap_64",
+        "__builtin_bswap32", "__builtin_bswap64",
+        "__builtin_expect", "__inline", "__extension__"
+    }
 
-                    try:
-                        left_val = int(next(left_child.get_tokens()).spelling)
-                        right_val = int(next(right_child.get_tokens()).spelling)
+    def __init__(self, filename):
+        self.filename = filename
+        self.index = clang.cindex.Index.create()
+        self.translation_unit = None
+        self.suggestions = []
+        self._parse_file(filename)
 
-                        # --- Extract operator symbol ---
-                        op_token = None
-                        for token in node.get_tokens():
-                            if token.location.offset > left_child.extent.end.offset and \
-                               token.location.offset < right_child.extent.start.offset:
-                                op_token = token.spelling
-                                break
-                        if not op_token:
-                            op_token = node.spelling
+    # --- Static helper for Streamlit use ---
+    @staticmethod
+    def from_code(code: str):
+        """Create an Optimizer instance directly from a string of C code."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            temp_file = os.path.join(tmpdir, "temp.c")
+            with open(temp_file, "w") as f:
+                f.write(code)
+            opt = Optimizer(temp_file)
+            opt._analyze()
+            return opt.suggestions
 
-                        result = 0
-                        if op_token == '+': result = left_val + right_val
-                        elif op_token == '-': result = left_val - right_val
-                        elif op_token == '*': result = left_val * right_val
-                        elif op_token == '/': result = int(left_val / right_val)
-                        elif op_token == '%': result = left_val % right_val
+    def _parse_file(self, filename):
+        if not os.path.exists(filename):
+            raise FileNotFoundError(f"Test file not found: {filename}")
 
-                        if result != 0 or (left_val == 0 or right_val == 0):
-                            self.optimizations_found.append({
-                                "opt_type": "CONSTANT_FOLDING",
-                                "source_text": self.get_source_code(node),
-                                "suggestion": f"This expression can be pre-calculated at compile time to '{result}'.",
-                                "line": node.location.line,
-                                "node": node
-                            })
-                    except Exception as e:
-                        print(f"Error parsing constant: {e}")
-
-        # Recurse on children
-        for child in node.get_children():
-            self._find_constant_folding(child)
-
-    def analyze(self, c_code: str):
-        """
-        Main function to analyze C code for optimization opportunities.
-        """
-        self.c_code = c_code
-        self.optimizations_found = []
-
-        index = clang.cindex.Index.create()
-        self.tu = index.parse(
-            'test.c',
-            args=[],
-            unsaved_files=[('test.c', c_code)],
-            options=clang.cindex.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD
-        )
-
-        if not self.tu:
-            raise RuntimeError("Error: Unable to parse the C code.")
-
-        root_node = self.tu.cursor
-
-        # --- 1. Run AST-based analyses (Constant Folding) ---
-        print("Running Constant Folding...")
-        self._find_constant_folding(root_node)
-
-        # --- 2. Build CFGs for all functions ---
-        print("Building CFGs...")
-        cfg_builder = CFGBuilder(c_code)
-        all_cfgs = cfg_builder.build_cfgs(root_node)
-
-        # --- DEBUG: Print tokens for every BINARY_OPERATOR in the AST ---
-        print("\n--- AST Token Debug ---")
-        for cursor in root_node.walk_preorder():
-            if cursor.kind == clang.cindex.CursorKind.BINARY_OPERATOR:
-                tokens = [t.spelling for t in cursor.get_tokens()]
-                print(f"Line {cursor.location.line}: Tokens = {tokens}")
-        print("--- END TOKEN DEBUG ---\n")
-
-        # --- 3. Run Data Flow Analyses on each function's CFG ---
-        for func_name, cfg in all_cfgs.items():
-            print(f"Analyzing function: {func_name}")
-
-            # --- Liveness & Dead Code ---
-            print("  Running Liveness Analysis...")
-            liveness = LivenessAnalysis(cfg)
-            liveness_results = liveness.run()
-            dead_code = find_dead_code(cfg, liveness_results)
-            self.optimizations_found.extend(dead_code)
-
-            # --- Available Expressions & CSE ---
-            print("  Running Available Expressions Analysis...")
-            avail_expr = AvailableExpressionsAnalysis(cfg)
-            avail_expr_results = avail_expr.run()
-            cse = find_common_subexpressions(cfg, avail_expr_results)
-            self.optimizations_found.extend(cse)
-
-            # --- Loop Invariant Code ---
-            print("  Finding Loops...")
-            loop_invariants = find_loop_invariant_code(cfg)
-            self.optimizations_found.extend(loop_invariants)
-
-        # --- 4. Post-process: Get source code for all findings ---
-        final_findings = []
-        found_set = set()
-
-        for finding in self.optimizations_found:
-            key = (finding["opt_type"], finding["line"], finding["suggestion"])
-            if key in found_set:
+        base_args = ["-x", "c", "-std=c11", "-I.", "-nostdinc"]
+        for args in (base_args, ["-x", "c", "-std=c11", "-I."], ["-x", "c"]):
+            try:
+                self.translation_unit = self.index.parse(filename, args=args)
+                return
+            except TranslationUnitLoadError:
                 continue
-            found_set.add(key)
 
-            if "source_text" not in finding or finding["source_text"].startswith("(Could not"):
-                finding["source_text"] = self.get_source_code(finding["node"])
-            final_findings.append(finding)
+        raise RuntimeError("❌ Unable to parse translation unit. Check libclang path or file validity.")
 
-        return final_findings
-
-
-if __name__ == "__main__":
-    print("🔍 Running optimizer test...")
-
-    # --- Example test C code ---
-    c_code = r"""
-    int test_optimizations(int a, int b) {
-        int x = a + b;
-        int y = a + b;
-        for (int i = 0; i < 5; i++) {
-            int z = x + 2;
-        }
-        return y;
-    }
-
-    int process_data(int n) {
-        int sum = 0;
-        int i = 0;
-        while (i < n) {
-            int temp = n * 2;
-            sum += temp;
-            i++;
-        }
-        return sum;
-    }
-    """
-
-    # Run the optimizer
-    opt = Optimizer()
-    results = opt.analyze(c_code)
-
-    # Print results
-    if not results:
-        print("✅ No optimizations found.")
-    else:
+    # --- Core pipeline ---
+    def run(self):
+        print("🔍 Running optimizer test...")
+        self._analyze()
         print("\n=== Optimization Suggestions ===")
-        for r in results:
-            print(f"[{r['opt_type']}] Line {r['line']}: {r['suggestion']}")
+        if not self.suggestions:
+            print("⚠️ No optimization opportunities detected.")
+        else:
+            for s in sorted(self.suggestions, key=lambda x: (x["file"], x["line"])):
+                print(f"[{s['opt_type']}] {s['file']}:{s['line']}: {s['suggestion']}")
+
+    def _analyze(self):
+        cursor = self.translation_unit.cursor
+        for func_cursor in cursor.walk_preorder():
+            if func_cursor.kind == CursorKind.FUNCTION_DECL and func_cursor.is_definition():
+                self._dataflow_analysis(func_cursor)
+
+    def _dataflow_analysis(self, func_cursor):
+        tokens = [
+            t for t in func_cursor.get_tokens()
+            if not (t.spelling in self.NOISE_TOKENS)
+        ]
+
+        exprs = []
+        cur_tokens = []
+        start_line = None
+        for t in tokens:
+            if start_line is None and t.location and t.location.file and t.location.file.name == os.path.abspath(self.filename):
+                start_line = t.location.line
+            cur_tokens.append(t)
+            if t.kind == TokenKind.PUNCTUATION and t.spelling == ";":
+                lines = [tok.spelling for tok in cur_tokens if not (tok.kind == TokenKind.COMMENT)]
+                if lines:
+                    first_line, last_line = None, None
+                    for tok in cur_tokens:
+                        if tok.location and tok.location.file and os.path.abspath(tok.location.file.name) == os.path.abspath(self.filename):
+                            if first_line is None:
+                                first_line = tok.location.line
+                            last_line = tok.location.line
+                    exprs.append({
+                        "text": " ".join(lines).strip(),
+                        "start_line": first_line or func_cursor.location.line,
+                        "end_line": last_line or func_cursor.location.line
+                    })
+                cur_tokens, start_line = [], None
+
+        self._find_optimizations(exprs)
+
+    def _find_optimizations(self, exprs):
+        seen_exprs = set()
+        suggestions = []
+        for i, e in enumerate(exprs):
+            text = e["text"]
+            line = e["start_line"] or e["end_line"] or 0
+            norm = re.sub(r'\s+', ' ', text).strip()
+
+            # --- Dead Code Elimination ---
+            m_decl = re.search(r'(?:int\s+)?([A-Za-z_]\w*)\s*=\s*([^;]+)', norm)
+            if m_decl:
+                var = m_decl.group(1)
+                if var not in ("i",):
+                    used_later = any(re.search(rf'\b{re.escape(var)}\b', o["text"]) for o in exprs[i+1:])
+                    if not used_later:
+                        suggestions.append({
+                            "opt_type": "DEAD_CODE_ELIMINATION",
+                            "file": os.path.abspath(self.filename),
+                            "line": line,
+                            "suggestion": f"The assignment to '{var}' appears never to be used later."
+                        })
+
+            # --- Redundant Expression ---
+            if re.search(r'=\s*[A-Za-z_]\w*\s*\+\s*0', norm) or re.search(r'=\s*[A-Za-z_]\w*\s*\*\s*1', norm):
+                suggestions.append({
+                    "opt_type": "REDUNDANT_EXPRESSION",
+                    "file": os.path.abspath(self.filename),
+                    "line": line,
+                    "suggestion": f"The expression '{text.strip()}' is redundant and has no effect."
+                })
+
+            # --- Common Subexpression ---
+            binary_ops = re.findall(r'([A-Za-z_]\w*\s*[\+\-\*/]\s*[A-Za-z_0-9\(\)]+)', norm)
+            for op in binary_ops:
+                key = re.sub(r'\s+', '', op)
+                if re.search(r'(\+0|0\+|^\s*1\*|\*1\b)', op):
+                    continue
+                if key in seen_exprs:
+                    suggestions.append({
+                        "opt_type": "COMMON_SUBEXPRESSION_ELIMINATION",
+                        "file": os.path.abspath(self.filename),
+                        "line": line,
+                        "suggestion": f"The expression '{op.strip()}' has already been computed earlier."
+                    })
+                else:
+                    seen_exprs.add(key)
+
+        # Deduplicate
+        unique = {(s["opt_type"], s["file"], s["line"], s["suggestion"]): s for s in suggestions}
+        self.suggestions.extend(unique.values())
+
+
+# ---------- CLI Mode ----------
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        test_file = sys.argv[1]
+        optimizer = Optimizer(test_file)
+        optimizer.run()
+    else:
+        # Default demo file
+        sample = r'''
+int compute(int a, int b) {
+    int x = a + b;
+    int y = x * 2;
+    int z = x + 0;
+    int total = 0;
+    int limit = 5;
+    int unused_var = 42;
+    for (int i = 0; i < limit; i++) {
+        total = total + (a + b);
+    }
+    return total + y + z;
+}
+'''
+        print("⚙️ Running demo on internal sample code...")
+        results = Optimizer.from_code(sample)
+        for s in results:
+            print(f"[{s['opt_type']}] line {s['line']}: {s['suggestion']}")
