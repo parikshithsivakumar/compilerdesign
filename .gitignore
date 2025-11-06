@@ -1,0 +1,59 @@
+# ======================
+# Python
+# ======================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pdb
+*.so
+*.egg
+*.egg-info/
+*.manifest
+*.spec
+
+# ======================
+# Virtual Environments
+# ======================
+venv/
+env/
+ENV/
+.venv/
+env.bak/
+venv.bak/
+
+# ======================
+# Environment Variables
+# ======================
+.env
+*.env
+
+# ======================
+# VS Code
+# ======================
+.vscode/
+*.code-workspace
+
+# ======================
+# Logs and Caches
+# ======================
+*.log
+*.tmp
+*.cache/
+*.mypy_cache/
+*.pytest_cache/
+.pytest_cache/
+coverage/
+htmlcov/
+__pycache__/
+
+# ======================
+# OS-specific
+# ======================
+.DS_Store
+Thumbs.db
+
+# ======================
+# Misc
+# ======================
+config.toml
