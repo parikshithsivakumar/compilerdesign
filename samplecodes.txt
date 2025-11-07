@@ -1,0 +1,36 @@
+#include <string.h>
+#include <stdio.h>
+
+void insecure_copy(char *input) {
+    char buffer[50];
+    strcpy(buffer, input); // unsafe, risk of buffer overflow
+    printf("Copied: %s\n", buffer);
+}
+
+
+int compute(int a, int b) {
+    int x = a + b;
+    int y = a + b;   // common subexpression
+    int z = x + 0;   // redundant expression
+    int unused = 42; // dead code
+    int total = x * 2;
+    return total + y;
+}
+
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+void risky_delete(const char *file) {}
+
+int compute(int a, int b) {
+    int x = a + b;
+    int y = x * 2;
+    int z = x + 0;
+    int total = 0;
+    int limit = 5;
+    int unused_var = 42; // dead code
+
+    return total + y + z;
+}
